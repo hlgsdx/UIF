@@ -1,0 +1,206 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v1.0.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: windows-2022
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            platform: Win32
+          - arch: x64
+            platform: x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+        with:
+          vs-version: "[17.0,18.0)"
+
+      - name: Build all proxy DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $project = "src\UniversalInjectorFramework\UniversalInjectorFramework.vcxproj"
+
+          $proxies = @(
+            "d3d8",
+            "d3d9",
+            "d3d11",
+            "d3dcompiler_43",
+            "d3dcompiler_47",
+            "d3dx9_43",
+            "dxgi",
+            "iphlpapi",
+            "opengl32",
+            "version",
+            "winmm"
+          )
+
+          $platform = "${{ matrix.platform }}"
+          $arch = "${{ matrix.arch }}"
+
+          $packageDir = Join-Path $PWD "package\$arch"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $packageDir | Out-Null
+
+          foreach ($proxy in $proxies) {
+            Write-Host ""
+            Write-Host "========================================"
+            Write-Host "Building $proxy [$platform]"
+            Write-Host "========================================"
+
+            & msbuild `
+              $project `
+              /m `
+              /t:Rebuild `
+              "/p:Configuration=$proxy" `
+              "/p:Platform=$platform" `
+              "/p:PlatformToolset=v143" `
+              /verbosity:minimal
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "MSBuild failed: $proxy / $platform"
+            }
+
+            $dll = "src\Build\UniversalInjectorFramework\$platform\$proxy\$proxy.dll"
+
+            if (-not (Test-Path $dll)) {
+              throw "Expected output DLL not found: $dll"
+            }
+
+            Copy-Item `
+              -Path $dll `
+              -Destination $packageDir `
+              -Force
+          }
+
+          Write-Host ""
+          Write-Host "Build results:"
+          Get-ChildItem $packageDir | Format-Table Name, Length
+
+      - name: Create build information
+        shell: pwsh
+        run: |
+          $packageDir = "package\${{ matrix.arch }}"
+
+          @"
+          UniversalInjectorFramework binary release
+
+          Tag: $env:RELEASE_TAG
+          Commit: $env:GITHUB_SHA
+          Architecture: ${{ matrix.arch }}
+          Platform: ${{ matrix.platform }}
+          Toolset: v143
+          "@ | Set-Content `
+            -Path "$packageDir\BUILD_INFO.txt" `
+            -Encoding UTF8
+
+      - name: Package binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+
+          $zip = "dist\UniversalInjectorFramework-$env:RELEASE_TAG-${{ matrix.arch }}.zip"
+
+          Compress-Archive `
+            -Path "package\${{ matrix.arch }}\*" `
+            -DestinationPath $zip `
+            -CompressionLevel Optimal `
+            -Force
+
+          Write-Host "Created: $zip"
+
+          Get-FileHash `
+            -Path $zip `
+            -Algorithm SHA256 |
+            Format-List
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd dist
+
+          sha256sum *.zip > SHA256SUMS.txt
+
+          echo "Release files:"
+          ls -lh
+
+          echo
+          echo "SHA256:"
+          cat SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; replacing assets."
+
+            gh release upload "$RELEASE_TAG" \
+              dist/*.zip \
+              dist/SHA256SUMS.txt \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              dist/*.zip \
+              dist/SHA256SUMS.txt \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TAG" \
+              --generate-notes
+          fi

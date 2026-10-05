@@ -29,24 +29,321 @@ jobs:
         include:
           - arch: x86
             platform: Win32
+
           - arch: x64
             platform: x64
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      # ------------------------------------------------------------
+      # Checkout
+      # ------------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------
+      # Setup Visual Studio / MSBuild
+      # ------------------------------------------------------------
 
       - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v3
+        uses: microsoft/setup-msbuild@v2
         with:
           vs-version: "[17.0,18.0)"
+
+      # ------------------------------------------------------------
+      # Runtime patch
+      #
+      # UIF configuration:
+      #   d3d8 / d3d9 / dxgi / ...
+      #
+      # Detours configuration:
+      #   Debug / Release
+      #
+      # Force ProjectReference:
+      #
+      #   Configuration = Release
+      #   Platform      = $(Platform)
+      #
+      # This only modifies the checked-out working tree in Actions.
+      # Nothing is committed back to the repository.
+      # ------------------------------------------------------------
+
+      - name: Patch Detours ProjectReference
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $projectPath = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "src\UniversalInjectorFramework\UniversalInjectorFramework.vcxproj"
+
+          Write-Host "Patching:"
+          Write-Host "  $projectPath"
+
+          if (-not (Test-Path $projectPath)) {
+            throw "Project file not found: $projectPath"
+          }
+
+          # Load MSBuild project XML.
+          [xml]$xml = Get-Content `
+            -LiteralPath $projectPath `
+            -Raw
+
+          $namespaceUri = "http://schemas.microsoft.com/developer/msbuild/2003"
+
+          $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+          $ns.AddNamespace("msb", $namespaceUri)
+
+          # Locate:
+          #
+          # <ProjectReference Include="..\Detours\Detours.vcxproj">
+          #
+          $reference = $xml.SelectSingleNode(
+            "//msb:ProjectReference[contains(@Include, 'Detours\Detours.vcxproj')]",
+            $ns
+          )
+
+          if ($null -eq $reference) {
+            throw "Unable to locate Detours ProjectReference."
+          }
+
+          Write-Host "Found Detours reference:"
+          Write-Host "  $($reference.Include)"
+
+          # --------------------------------------------------------
+          # SetConfiguration
+          # --------------------------------------------------------
+
+          $setConfiguration = $reference.SelectSingleNode(
+            "msb:SetConfiguration",
+            $ns
+          )
+
+          if ($null -eq $setConfiguration) {
+            $setConfiguration = $xml.CreateElement(
+              "SetConfiguration",
+              $namespaceUri
+            )
+
+            [void]$reference.AppendChild($setConfiguration)
+          }
+
+          $setConfiguration.InnerText = "Configuration=Release"
+
+          # --------------------------------------------------------
+          # SetPlatform
+          #
+          # Keep literal $(Platform), do NOT let PowerShell expand it.
+          # --------------------------------------------------------
+
+          $setPlatform = $reference.SelectSingleNode(
+            "msb:SetPlatform",
+            $ns
+          )
+
+          if ($null -eq $setPlatform) {
+            $setPlatform = $xml.CreateElement(
+              "SetPlatform",
+              $namespaceUri
+            )
+
+            [void]$reference.AppendChild($setPlatform)
+          }
+
+          $setPlatform.InnerText = 'Platform=$(Platform)'
+
+          # --------------------------------------------------------
+          # Save as UTF-8
+          # --------------------------------------------------------
+
+          $settings = New-Object System.Xml.XmlWriterSettings
+          $settings.Encoding = New-Object System.Text.UTF8Encoding($false)
+          $settings.Indent = $true
+
+          $writer = [System.Xml.XmlWriter]::Create(
+            $projectPath,
+            $settings
+          )
+
+          try {
+            $xml.Save($writer)
+          }
+          finally {
+            $writer.Dispose()
+          }
+
+          Write-Host ""
+          Write-Host "ProjectReference patched successfully."
+
+          # --------------------------------------------------------
+          # Verify runtime patch
+          # --------------------------------------------------------
+
+          [xml]$verifyXml = Get-Content `
+            -LiteralPath $projectPath `
+            -Raw
+
+          $verifyNs = New-Object System.Xml.XmlNamespaceManager(
+            $verifyXml.NameTable
+          )
+
+          $verifyNs.AddNamespace(
+            "msb",
+            $namespaceUri
+          )
+
+          $verifyReference = $verifyXml.SelectSingleNode(
+            "//msb:ProjectReference[contains(@Include, 'Detours\Detours.vcxproj')]",
+            $verifyNs
+          )
+
+          if ($null -eq $verifyReference) {
+            throw "Verification failed: Detours ProjectReference disappeared."
+          }
+
+          $verifyConfiguration = $verifyReference.SelectSingleNode(
+            "msb:SetConfiguration",
+            $verifyNs
+          )
+
+          $verifyPlatform = $verifyReference.SelectSingleNode(
+            "msb:SetPlatform",
+            $verifyNs
+          )
+
+          if ($verifyConfiguration.InnerText -ne "Configuration=Release") {
+            throw "SetConfiguration verification failed."
+          }
+
+          if ($verifyPlatform.InnerText -ne 'Platform=$(Platform)') {
+            throw "SetPlatform verification failed."
+          }
+
+          Write-Host ""
+          Write-Host "Effective ProjectReference:"
+          Write-Host "  Include          = $($verifyReference.Include)"
+          Write-Host "  SetConfiguration = $($verifyConfiguration.InnerText)"
+          Write-Host "  SetPlatform      = $($verifyPlatform.InnerText)"
+
+          Write-Host ""
+          Write-Host "Runtime git diff:"
+          git diff -- `
+            "src/UniversalInjectorFramework/UniversalInjectorFramework.vcxproj"
+
+      # ------------------------------------------------------------
+      # Prepare paths
+      #
+      # Both UIF and Detours use $(SolutionDir) in their project files.
+      # We build the vcxproj directly, so supply it explicitly.
+      # ------------------------------------------------------------
+
+      - name: Prepare build directories
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path "package\${{ matrix.arch }}" |
+            Out-Null
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path "dist" |
+            Out-Null
+
+      # ------------------------------------------------------------
+      # Build Detours once
+      #
+      # This is not strictly required after the ProjectReference patch,
+      # but doing it explicitly makes failures easier to diagnose and
+      # prevents rebuilding Detours unnecessarily for every proxy.
+      # ------------------------------------------------------------
+
+      - name: Build Detours
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $project = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "src\Detours\Detours.vcxproj"
+
+          $solutionDir = (
+            Resolve-Path `
+              (Join-Path $env:GITHUB_WORKSPACE "src")
+          ).Path + "\"
+
+          $platform = "${{ matrix.platform }}"
+
+          Write-Host "========================================"
+          Write-Host "Building Detours"
+          Write-Host "========================================"
+          Write-Host "Configuration : Release"
+          Write-Host "Platform      : $platform"
+          Write-Host "SolutionDir   : $solutionDir"
+          Write-Host ""
+
+          & msbuild `
+            $project `
+            /m `
+            /t:Build `
+            "/p:Configuration=Release" `
+            "/p:Platform=$platform" `
+            "/p:PlatformToolset=v143" `
+            "/p:SolutionDir=$solutionDir" `
+            /verbosity:minimal
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Detours build failed: Release / $platform"
+          }
+
+          $detoursLib = Join-Path `
+            $solutionDir `
+            "Build\Detours\$platform\Release\Detours.lib"
+
+          if (-not (Test-Path $detoursLib)) {
+            Write-Host ""
+            Write-Host "Build directory:"
+            Get-ChildItem `
+              (Join-Path $solutionDir "Build\Detours") `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Select-Object FullName
+
+            throw "Detours.lib not found: $detoursLib"
+          }
+
+          Write-Host ""
+          Write-Host "Detours built successfully:"
+          Write-Host "  $detoursLib"
+
+      # ------------------------------------------------------------
+      # Build every UIF proxy DLL
+      # ------------------------------------------------------------
 
       - name: Build all proxy DLLs
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $project = "src\UniversalInjectorFramework\UniversalInjectorFramework.vcxproj"
+          $project = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "src\UniversalInjectorFramework\UniversalInjectorFramework.vcxproj"
+
+          $solutionDir = (
+            Resolve-Path `
+              (Join-Path $env:GITHUB_WORKSPACE "src")
+          ).Path + "\"
+
+          $platform = "${{ matrix.platform }}"
+          $arch = "${{ matrix.arch }}"
+
+          $packageDir = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "package\$arch"
 
           $proxies = @(
             "d3d8",
@@ -62,16 +359,6 @@ jobs:
             "winmm"
           )
 
-          $platform = "${{ matrix.platform }}"
-          $arch = "${{ matrix.arch }}"
-
-          $packageDir = Join-Path $PWD "package\$arch"
-
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $packageDir | Out-Null
-
           foreach ($proxy in $proxies) {
             Write-Host ""
             Write-Host "========================================"
@@ -81,89 +368,204 @@ jobs:
             & msbuild `
               $project `
               /m `
-              /t:Rebuild `
+              /t:Build `
               "/p:Configuration=$proxy" `
               "/p:Platform=$platform" `
               "/p:PlatformToolset=v143" `
+              "/p:SolutionDir=$solutionDir" `
               /verbosity:minimal
 
             if ($LASTEXITCODE -ne 0) {
               throw "MSBuild failed: $proxy / $platform"
             }
 
-            $dll = "src\Build\UniversalInjectorFramework\$platform\$proxy\$proxy.dll"
+            $dll = Join-Path `
+              $solutionDir `
+              "Build\UniversalInjectorFramework\$platform\$proxy\$proxy.dll"
 
             if (-not (Test-Path $dll)) {
+              Write-Host ""
+              Write-Host "Expected DLL not found:"
+              Write-Host "  $dll"
+
+              Write-Host ""
+              Write-Host "Current UIF build tree:"
+
+              Get-ChildItem `
+                (Join-Path $solutionDir "Build\UniversalInjectorFramework") `
+                -Recurse `
+                -ErrorAction SilentlyContinue |
+                Select-Object FullName
+
               throw "Expected output DLL not found: $dll"
             }
 
             Copy-Item `
-              -Path $dll `
+              -LiteralPath $dll `
               -Destination $packageDir `
               -Force
+
+            Write-Host "Built:"
+            Write-Host "  $dll"
           }
 
           Write-Host ""
-          Write-Host "Build results:"
-          Get-ChildItem $packageDir | Format-Table Name, Length
+          Write-Host "========================================"
+          Write-Host "Completed $arch build"
+          Write-Host "========================================"
+
+          Get-ChildItem `
+            $packageDir |
+            Select-Object Name, Length |
+            Format-Table -AutoSize
+
+      # ------------------------------------------------------------
+      # BUILD_INFO.txt
+      # ------------------------------------------------------------
 
       - name: Create build information
         shell: pwsh
         run: |
-          $packageDir = "package\${{ matrix.arch }}"
+          $ErrorActionPreference = "Stop"
 
-          @"
+          $packageDir = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "package\${{ matrix.arch }}"
+
+          $buildInfo = @"
           UniversalInjectorFramework binary release
 
+          Repository: $env:GITHUB_REPOSITORY
           Tag: $env:RELEASE_TAG
           Commit: $env:GITHUB_SHA
           Architecture: ${{ matrix.arch }}
           Platform: ${{ matrix.platform }}
-          Toolset: v143
-          "@ | Set-Content `
-            -Path "$packageDir\BUILD_INFO.txt" `
-            -Encoding UTF8
+          MSVC Toolset: v143
+
+          Proxy DLLs:
+          - d3d8.dll
+          - d3d9.dll
+          - d3d11.dll
+          - d3dcompiler_43.dll
+          - d3dcompiler_47.dll
+          - d3dx9_43.dll
+          - dxgi.dll
+          - iphlpapi.dll
+          - opengl32.dll
+          - version.dll
+          - winmm.dll
+          "@
+
+          $buildInfo |
+            Set-Content `
+              -LiteralPath "$packageDir\BUILD_INFO.txt" `
+              -Encoding utf8
+
+      # ------------------------------------------------------------
+      # ZIP
+      # ------------------------------------------------------------
 
       - name: Package binaries
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          $ErrorActionPreference = "Stop"
 
-          $zip = "dist\UniversalInjectorFramework-$env:RELEASE_TAG-${{ matrix.arch }}.zip"
+          $source = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "package\${{ matrix.arch }}\*"
+
+          $zip = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "dist\UniversalInjectorFramework-$env:RELEASE_TAG-${{ matrix.arch }}.zip"
 
           Compress-Archive `
-            -Path "package\${{ matrix.arch }}\*" `
+            -Path $source `
             -DestinationPath $zip `
             -CompressionLevel Optimal `
             -Force
 
-          Write-Host "Created: $zip"
+          if (-not (Test-Path $zip)) {
+            throw "ZIP package creation failed."
+          }
+
+          Write-Host ""
+          Write-Host "Created:"
+          Write-Host "  $zip"
+
+          Write-Host ""
+          Write-Host "SHA256:"
 
           Get-FileHash `
-            -Path $zip `
+            -LiteralPath $zip `
             -Algorithm SHA256 |
             Format-List
 
+      # ------------------------------------------------------------
+      # Upload intermediate build artifact
+      # ------------------------------------------------------------
+
       - name: Upload build artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.arch }}
           path: dist/*.zip
           if-no-files-found: error
           retention-days: 7
 
+
+  # ================================================================
+  # Release
+  # ================================================================
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs:
+      - build
+
     runs-on: ubuntu-latest
 
     steps:
+      # ------------------------------------------------------------
+      # Download x86 + x64 packages
+      # ------------------------------------------------------------
+
       - name: Download build artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           pattern: release-*
           merge-multiple: true
           path: dist
+
+      # ------------------------------------------------------------
+      # Validate packages
+      # ------------------------------------------------------------
+
+      - name: Validate release files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Release files:"
+          find dist -maxdepth 1 -type f -print
+
+          X86="dist/UniversalInjectorFramework-${RELEASE_TAG}-x86.zip"
+          X64="dist/UniversalInjectorFramework-${RELEASE_TAG}-x64.zip"
+
+          if [[ ! -f "$X86" ]]; then
+            echo "Missing x86 package:"
+            echo "$X86"
+            exit 1
+          fi
+
+          if [[ ! -f "$X64" ]]; then
+            echo "Missing x64 package:"
+            echo "$X64"
+            exit 1
+          fi
+
+      # ------------------------------------------------------------
+      # Checksums
+      # ------------------------------------------------------------
 
       - name: Generate SHA256 checksums
         shell: bash
@@ -172,14 +574,24 @@ jobs:
 
           cd dist
 
-          sha256sum *.zip > SHA256SUMS.txt
-
-          echo "Release files:"
-          ls -lh
+          sha256sum \
+            UniversalInjectorFramework-"${RELEASE_TAG}"-x86.zip \
+            UniversalInjectorFramework-"${RELEASE_TAG}"-x64.zip \
+            > SHA256SUMS.txt
 
           echo
-          echo "SHA256:"
+          echo "SHA256SUMS.txt:"
           cat SHA256SUMS.txt
+
+      # ------------------------------------------------------------
+      # GitHub Release
+      #
+      # Existing release:
+      #   replace assets
+      #
+      # New release:
+      #   create tag/release and generate notes
+      # ------------------------------------------------------------
 
       - name: Create or update GitHub Release
         shell: bash
@@ -189,18 +601,27 @@ jobs:
         run: |
           set -euo pipefail
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "Release $RELEASE_TAG already exists; replacing assets."
+          echo "Publishing release:"
+          echo "  Tag: ${RELEASE_TAG}"
+          echo "  SHA: ${GITHUB_SHA}"
 
-            gh release upload "$RELEASE_TAG" \
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo
+            echo "Release already exists."
+            echo "Replacing assets..."
+
+            gh release upload "${RELEASE_TAG}" \
               dist/*.zip \
               dist/SHA256SUMS.txt \
               --clobber
           else
-            gh release create "$RELEASE_TAG" \
+            echo
+            echo "Creating new release..."
+
+            gh release create "${RELEASE_TAG}" \
               dist/*.zip \
               dist/SHA256SUMS.txt \
-              --target "$GITHUB_SHA" \
-              --title "$RELEASE_TAG" \
+              --target "${GITHUB_SHA}" \
+              --title "${RELEASE_TAG}" \
               --generate-notes
           fi

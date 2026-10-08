@@ -44,24 +44,11 @@ jobs:
         with:
           vs-version: '[17.0,18.0)'
 
-      - name: Install VS 2017 Windows XP toolset
+      - name: Install and verify VS 2017 Windows XP toolset
         if: matrix.arch == 'x86-xp'
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $installerDir = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
-          $vswhere = Join-Path $installerDir 'vswhere.exe'
-          $setup = Join-Path $installerDir 'setup.exe'
-          $vsPath = (& $vswhere -latest -products '*' -version '[17.0,18.0)' -property installationPath | Select-Object -First 1)
-          if (-not $vsPath) { throw 'Visual Studio 2022 installation not found' }
-          if (-not (Test-Path $setup)) { throw "Visual Studio installer not found: $setup" }
-          $toolsetDir = Join-Path $vsPath 'MSBuild\Microsoft\VC\v170\Platforms\Win32\PlatformToolsets\v141_xp'
-          if (-not (Test-Path $toolsetDir)) {
-            $args = 'modify --installPath "{0}" --add Microsoft.VisualStudio.Component.WinXP --quiet --norestart' -f $vsPath
-            $p = Start-Process -FilePath $setup -ArgumentList $args -WorkingDirectory $env:TEMP -Wait -PassThru
-            if ($p.ExitCode -ne 0) { throw "v141_xp installation failed, exit code $($p.ExitCode)" }
-          }
-          if (-not (Test-Path $toolsetDir)) { throw "v141_xp missing after installation: $toolsetDir" }
+        timeout-minutes: 20
+        run: ./.github/scripts/install-xp-toolset.ps1
 
       - name: Prepare XP-specific source and projects
         if: matrix.arch == 'x86-xp'
